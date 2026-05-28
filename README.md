@@ -1,42 +1,46 @@
 # FPGA Image Filter Accelerator
 
-Hardware-accelerated spatial image filtering on the **Pynq-Z2** board (Zynq-7000 SoC), achieving up to **357× speedup** over software-only processing.
+Hardware-accelerated spatial image filtering on the **Pynq-Z2** board (Zynq-7000 SoC), achieving up to **357× speedup** over ARM Cortex-A9 software processing.
 
-Developed as a university project for the course *Digitalni VLSI Sistemi* (Digital VLSI Systems), 2025/26.
+Developed as a university project for the course *Digitalni VLSI Sistemi* (Digital VLSI Systems), 2025/26, Faculty of Electrical Engineering, University of Belgrade.
 
 ---
 
 ## Overview
 
-This project implements a configurable **linear spatial image filter** in hardware (VHDL), supporting arbitrary filter kernels up to **9×9** in size. The hardware accelerator (`acc_image_filter`) is connected to the ARM Cortex-A9 processor via AXI4 interfaces and a DMA controller, enabling high-throughput pixel-streaming processing.
+This project implements a configurable **linear spatial image filter** accelerator in VHDL, supporting arbitrary filter kernels up to **9×9**. Pixels are streamed into the accelerator via AXI4-Stream from a DMA controller. The accelerator computes the weighted neighborhood sum for each pixel in a **fully pipelined** fashion — all multiplications across the kernel happen in parallel, giving **O(1) per-pixel throughput** regardless of kernel size.
 
-The system supports:
-- Filter radii from 0 to 4 (kernel sizes: 1×1, 3×3, 5×5, 7×7, 9×9)
-- Box blur, Gaussian blur, LoG (edge detection), sharpening filters, Sobel and Prewitt filters
-- 8-bit unsigned output or 16-bit signed fixed-point output
-- Runtime reconfiguration — new images and filter parameters can be applied without restarting
-- Software/hardware result verification (`CheckData`)
-- Execution time measurement via AXI Timer
+The ARM Cortex-A9 processor configures the accelerator via AXI4-Lite registers, loads images into DDR memory, triggers DMA transfers, times both software and hardware runs, and verifies that the results match.
+
+**Supported filter types** (all generated on-chip in C):
+- Box (averaging) filter
+- Gaussian blur
+- LoG — Laplacian of Gaussian (edge detection)
+- Sharpening based on box filter
+- Sharpening based on Gaussian filter
+- Sobel (gradient approximation via derivative of Gaussian)
+- Prewitt (linear derivative)
+- Bypass mode (pixel passthrough, no filtering)
 
 ---
 
 ## Repository Structure
 
 ```
-dvs25-image-filter-accelerator/
+image-filter-accelerator/
 ├── hardware/
 │   └── src/
 │       ├── acc_image_filter.vhd     # Top-level accelerator module
-│       ├── ALU_filter.vhd           # Filter arithmetic unit (MAC array)
-│       ├── my_types_PK.vhd          # Shared type definitions package
-│       ├── RAM_definitions_PK.vhd   # RAM/BRAM-related definitions package
-│       └── RAM_line_buffer.vhd      # Line buffer (BRAM-based row storage)
+│       ├── ALU_filter.vhd           # 6-stage pipelined filter arithmetic unit
+│       ├── RAM_line_buffer.vhd      # BRAM-based line buffer (column-packed words)
+│       ├── my_types_PK.vhd          # Shared types: coeff_array_type, State_t FSM
+│       └── RAM_definitions_PK.vhd   # clogb2() utility function for address width
 ├── block_design/
-│   └── image_filter_design.bd       # Vivado block design (DMA + Timer + accelerator)
+│   └── image_filter_design.bd       # Vivado block design (PS + DMA + Timer + acc)
 ├── software/
-│   └── main.c                       # Bare-metal C application (Vitis/SDK)
+│   └── main.c                       # Bare-metal C app (Vitis): menu, filter gen, timing
 ├── scripts/
-│   └── image_filter.ipynb           # Python notebook: image prep, result display
+│   └── image_filter.ipynb  # Python notebook: image prep & result display
 └── README.md
 ```
 
@@ -44,110 +48,168 @@ dvs25-image-filter-accelerator/
 
 ## System Architecture
 
+### Vivado Block Design
+
+![Block Design](docs/block_design.png)
+
+The complete system is built around the ZYNQ7 Processing System and consists of the following IP blocks:
+
+| Block | Role |
+|---|---|
+| **ZYNQ7 Processing System** | ARM Cortex-A9 host; runs `main.c`; connects to DDR and fixed I/O |
+| **AXI DMA** (`axi_dma_0`) | Streams pixels from DDR to accelerator (MM2S) and receives results back (S2MM); both interrupt lines feed the PS via `xlconcat_0` |
+| **acc_image_filter_v1_0** | Custom VHDL accelerator; receives 8-bit pixels on `s_axis`, sends 16-bit results on `m_axis`, configured via `s_axi_lite` |
+| **AXI Timer** (`axi_timer_0`) | Hardware timer used to measure SW and HW execution time in µs |
+| **AXI SmartConnect** (`axi_smc`) | Routes AXI4-Lite control buses from the PS GP0 port to the DMA, Timer, and accelerator |
+| **AXI Interconnect** (`axi_mem_intercon`) | Connects the DMA's high-performance master ports to the PS HP0 port (DDR access) |
+| **Processor System Reset** (`rst_ps7_0_100M`) | Generates synchronised resets for all PL peripherals |
+
+### Data Flow
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Zynq-7000 PS                      │
-│              ARM Cortex-A9 (main.c)                  │
-└────────────────────┬────────────────────────────────┘
-                     │ AXI4
-          ┌──────────┴──────────┐
-          │                     │
-   ┌──────▼──────┐      ┌───────▼──────┐
-   │  AXI Timer  │      │  AXI DMA     │
-   └─────────────┘      └──┬───────┬───┘
-                    AXI    │Stream │Stream
-                    ┌──────▼─┐  ┌──▼──────┐
-                    │ S_AXIS │  │ M_AXIS  │
-                    │ data_in│  │data_out │
-                    └────────┴──┴─────────┘
-                         acc_image_filter
-                      ┌──────────────────┐
-                      │  S_AXI_CTRL      │ ← AXI4-Lite (registers)
-                      │  Line Buffer     │ ← BRAM (2×FilterRadius rows)
-                      │  ALU Filter      │ ← Shift-register MAC array
-                      └──────────────────┘
+DDR (input image, uint8)
+        │
+        ▼  AXI4 HP0
+  AXI Interconnect
+        │
+        ▼  AXI4
+    AXI DMA  ──── MM2S ────► acc_image_filter  (8-bit AXI4-Stream)
+                                    │
+                             RAM_line_buffer   (single BRAM, 64-bit column words)
+                                    │
+                              ALU_filter       (6-stage fully pipelined MAC array)
+                                    │
+    AXI DMA  ◄─── S2MM ◄────────────           (16-bit AXI4-Stream results)
+        │
+        ▼  AXI4 HP0
+  AXI Interconnect
+        │
+        ▼
+DDR (output image, uint16)
 ```
 
-Input pixels are streamed in raster-scan order (left→right, top→bottom) via AXI4-Stream. The accelerator maintains a **line buffer** (BRAM-backed) and a **shift-register arithmetic unit** to compute the weighted sum of each pixel's local neighborhood in a fully pipelined fashion.
+The PS GP0 port controls all peripherals (DMA, Timer, accelerator registers) via the AXI SmartConnect using AXI4-Lite. DMA interrupts are concatenated by `xlconcat_0` and routed to the PS interrupt controller (`IRQ_F2P`).
 
 ---
 
 ## Hardware Modules
 
-### `acc_image_filter.vhd`
-Top-level module. Manages AXI4-Lite control registers, coordinates the line buffer and ALU, handles pixel validity tracking, and drives the output AXI4-Stream.
+### `acc_image_filter.vhd` — Top-level module
 
-### `ALU_filter.vhd`
-The filter arithmetic unit. Organized as `K` shift registers (one per filter row), each of length equal to the filter width. Each cycle, a new pixel column enters and the weighted sum across all `(2R+1)²` neighbors is computed in parallel using fixed-point multiply-accumulate.
+Generics:
+| Generic | Default | Description |
+|---|---|---|
+| `MAX_IMAGE_WIDTH` | 1024 | Maximum supported image width |
+| `MAX_IMAGE_HEIGHT` | 512 | Maximum supported image height |
+| `G_MAX_RADIUS` | 4 | Maximum filter radius (kernel up to 9×9) |
 
-### `RAM_line_buffer.vhd`
-BRAM-based line buffer storing `2×FilterRadius` previously received rows. Each memory word stores all pixels from the same column across stored rows, enabling a single-cycle read of an entire pixel column for the ALU.
+Three-state FSM (`St_Idle` → `St_Processing` → `St_Done`) controls data flow. On the first valid AXI-Stream pixel, parameters are latched from the AXI4-Lite registers into shadow registers — this ensures parameters cannot change mid-frame. A 1-entry pixel buffer (`buff_flag/buff_tdata`) handles the case where the input stream produces a pixel while the pipeline is not ready.
 
-### `my_types_PK.vhd` / `RAM_definitions_PK.vhd`
-Shared packages defining types, constants, and BRAM configuration used across modules.
+### `ALU_filter.vhd` — Pipelined arithmetic unit
+
+A **6-stage fully pipelined** MAC array:
+
+| Stage | Operation |
+|---|---|
+| 1 | Pixel counter latch (done in top-level) |
+| 2 | 9×9 shift register update; new pixel into row 0, BRAM rows into rows 1–8 |
+| 3 | 81 parallel multiplications: `pixel[r][c] × coeff[r][c]` (Q1.8 × Q1.15 → Q9.15) |
+| 4 | 9 row partial sums (32-bit accumulator) |
+| 5 | Total sum across all rows (32-bit) |
+| 6 | Multiply by `coeff_scale`, clip, and format output |
+
+Output modes (controlled by `MODE` bit in `reg_ctrl`):
+- **Mode 0** — 8-bit unsigned (`uint8`): result clipped to [0, 255]
+- **Mode 1** — 16-bit signed Q9.7 fixed-point: result clipped to [−32768, 32767]
+
+Validity tracking: `alu_valid_pipe` propagates through all 6 stages. A pixel is marked invalid if its row or column counter is less than `2×FilterRadius`, matching the border-cropping requirement.
+
+### `RAM_line_buffer.vhd` — BRAM line buffer
+
+Uses a **single BRAM block** with 64-bit wide words (for max radius 4). Each memory address stores one full column of the line buffer — all 8 previously received rows for that column position, packed as bytes from MSB (oldest) to LSB (newest).
+
+On each clock cycle:
+1. **Read**: fetch the 64-bit word at the current column address
+2. **Shift**: `new_word = {bram_rd_data[55:0], pixel_in}` — oldest row shifts out, newest pixel enters at LSB
+3. **Write**: store `new_word` back to the same address
+
+This eliminates the need for separate per-row BRAM blocks and efficiently uses a single 36Kb BRAM for images up to 512px wide (or a single 18Kb block for images up to 256px wide).
+
+### `my_types_PK.vhd` — Shared types
+
+Defines `coeff_array_type` (array of 81 16-bit coefficient registers) and `State_t` (the `St_Idle / St_Processing / St_Done / St_Wait` FSM type) shared across all modules.
+
+### `RAM_definitions_PK.vhd` — Utility package
+
+Provides `clogb2()` — ceiling log base 2 — used to compute the BRAM address bus width from the maximum image width generic.
+
+---
+
+## Software Application (`main.c`)
+
+Interactive bare-metal C application running on the ARM Cortex-A9. On each loop iteration:
+
+1. **User selects** filter type and parameters (radius, sigma, k, axis, output mode) via UART
+2. **Coefficients are generated on-chip** using floating-point math — no pre-computed tables needed:
+   - `CalculateScaleAndQuantize()` automatically finds the optimal `CoeffScale` by scaling the largest coefficient to ~0.95 of the Q1.15 range, minimizing quantization error
+3. **User loads the image** into DDR via the XDB `mwr` command; the app prints the exact command with the correct address and byte count
+4. **Accelerator is configured** via `AccConfigure()` — writes all 86 registers and read-back-verifies each one
+5. **Software reference run** (`FilterImageSW`) is timed with AXI Timer → stored in `ReferentBuffer`
+6. **Hardware run** (`FilterImageHW`) is timed — DMA transfers input plane(s) to the accelerator and receives results into `ResultBuffer`
+7. **Verification** (`CheckData`) compares every pixel between HW and SW results; reports first 15 mismatches if any
+8. **User saves outputs** from DDR via the XDB `mrd` command; the app prints the exact commands for both the HW result and SW reference
+
+Multi-plane (RGB) images are supported — each plane is processed independently as a separate DMA transfer.
 
 ---
 
 ## Accelerator Register Map
 
-All registers are 16-bit, accessed via AXI4-Lite (`s_axi_ctrl`).
+All registers are 16-bit wide, accessed as 32-bit AXI4-Lite words (2 LSBs of address unused).
 
-| Address | Register          | Description                                              |
-|---------|-------------------|----------------------------------------------------------|
-| `0x00`  | `reg_ctrl`        | Control: MODE (output format), BYPASS, BORD, BORDER_VALUE |
-| `0x02`  | `reg_radius`      | Filter radius [0–4]; kernel size = 2·radius+1            |
-| `0x04`  | `reg_img_w`       | Input image width (pixels)                               |
-| `0x06`  | `reg_img_h`       | Input image height (pixels)                              |
-| `0x08`  | `reg_coeff_scale` | Output scale factor (4.12 fixed-point, unsigned)         |
-| `0x0A`  | `reg_coeff_W0`    | Filter coefficient W0 (1.15 signed fixed-point)          |
-| …       | …                 | W1–W79 at consecutive even addresses                     |
-| `0xAA`  | `reg_coeff_W80`   | Filter coefficient W80                                   |
-
-Filter coefficients are 16-bit signed fixed-point with 1 integer bit and 15 fractional bits, covering the range [−1, +0.99997]. The scale factor compensates for coefficient quantization error.
+| Address | Register | Description |
+|---|---|---|
+| `0x00` | `reg_ctrl` | `[0]` MODE: 0=uint8, 1=Q9.7 · `[1]` BYPASS · `[3:2]` BORD · `[11:4]` BORDER_VALUE |
+| `0x04` | `reg_radius` | Filter radius [0–4]; kernel = (2·radius+1)² |
+| `0x08` | `reg_img_w` | Input image width |
+| `0x0C` | `reg_img_h` | Input image height |
+| `0x10` | `reg_coeff_scale` | Scale factor, UQ4.12 unsigned fixed-point |
+| `0x14` | `reg_coeff_W0` | Coefficient W0, Q1.15 signed fixed-point |
+| `0x18` | `reg_coeff_W1` | Coefficient W1 |
+| … | … | … |
+| `0x150` | `reg_coeff_W80` | Coefficient W80 |
 
 ---
 
-## Filter Coefficient Encoding
+## Coefficient Encoding
 
-Coefficients are represented as **Q1.15** signed fixed-point. To encode a real-valued coefficient `w`:
-
+Filter coefficients use **Q1.15 signed fixed-point** (range: [−1, +0.99997]):
 ```
-register_value = round(w * 2^15)
-```
-
-The scale factor (`coeff_scale`) is **UQ4.12** unsigned fixed-point:
-
-```
-scale_register = round(scale * 2^12)
+register_value = round(coefficient × 2¹⁵)
 ```
 
-**Example — 9×9 Box filter (all coefficients = 1/81):**
+The scale factor uses **UQ4.12 unsigned fixed-point** (range: [0, ~15.999]):
 ```
-register_value = round((1/81) * 32768) = 405
-scale_register = 4096  (scale = 1.0)
+scale_register = round(scale × 2¹²)
 ```
 
-**Example — 9×9 Gaussian filter (σ=1, inverse scale = 4):**
-```
-Each coefficient = W_gauss(x,y) / sum * 4,  quantized to Q1.15
-scale_register  = round((1/4) * 4096) = 1024
-```
+`CalculateScaleAndQuantize()` handles this automatically: it finds the maximum absolute coefficient, scales all coefficients so the largest maps to ~0.95 in Q1.15, and computes the corresponding inverse scale factor for the hardware output stage.
 
 ---
 
 ## Performance Results
 
-Measured using the on-chip AXI Timer (filtering operation only), on a Pynq-Z2 board.
+Measured using the on-chip AXI Timer (filtering operation only). All tests on Pynq-Z2.
 
-| Image     | Filter Type         | SW Time [µs] | HW Time [µs] | Speedup     |
-|-----------|---------------------|--------------|--------------|-------------|
-| lena_128  | Box (5×5)           | 42,651       | 406          | **105×**    |
-| lena_128  | Gaussian (9×9)      | 120,304      | 397          | **303×**    |
-| lena_512  | LoG (7×7)           | 1,315,591    | 5,935        | **222×**    |
-| lena_512  | Gaussian (9×9)      | 2,122,011    | 5,939        | **357×**    |
-| parrots   | Sharpening (7×7)    | 5,943,419    | 26,743       | **222×**    |
+| Image | Filter | SW Time [µs] | HW Time [µs] | Speedup |
+|---|---|---|---|---|
+| lena_128 | Box 5×5 | 42,651 | 406 | **105×** |
+| lena_128 | Gaussian 9×9 | 120,304 | 397 | **303×** |
+| lena_512 | LoG 7×7 | 1,315,591 | 5,935 | **222×** |
+| lena_512 | Gaussian 9×9 | 2,122,011 | 5,939 | **357×** |
+| parrots | Sharpening 7×7 | 5,943,419 | 26,743 | **222×** |
 
-The hardware execution time is **independent of kernel size** — a direct consequence of fully parallel multiply-accumulate across all filter taps (O(1) per-pixel throughput). Software time scales as O(N²) with kernel size.
+The HW time is **independent of kernel size** — Gaussian 9×9 and LoG 7×7 on the same image take essentially the same time (~5.9 ms), because all 81 multiplications execute in parallel within a single pipeline stage. Software time scales as O(N²) with kernel width.
 
 ---
 
@@ -155,33 +217,34 @@ The hardware execution time is **independent of kernel size** — a direct conse
 
 ### Prerequisites
 
-- Xilinx Vivado 2020.x (or compatible) for hardware synthesis
-- Vitis / Xilinx SDK for building the C application
+- Xilinx Vivado 2020.x+ for hardware synthesis
+- Vitis / Xilinx SDK for the C bare-metal application
 - Pynq-Z2 board
-- Python 3 with `numpy`, `matplotlib`, `Pillow` for the notebook
+- Python 3 with `numpy`, `matplotlib` for the notebook
 
 ### Build & Deploy
 
-1. **Open the block design** in Vivado: `block_design/image_filter_design.bd`
-2. **Add VHDL sources** from `hardware/src/` to the project
-3. **Run synthesis, implementation, and generate bitstream**
-4. **Export hardware** (`.xsa`) and open in Vitis
-5. **Build the C application** from `software/main.c`
-6. **Program the board** and run via UART
+1. Open Vivado → create a new project → add all `.vhd` files from `hardware/src/`
+2. Open the block design: `block_design/image_filter_design.bd`
+3. Run Synthesis → Implementation → Generate Bitstream
+4. Export hardware (`.xsa`) → open in Vitis
+5. Create a bare-metal application project, add `software/main.c`
+6. Build and program the board via JTAG
 
-### Preparing Images
+### Image Workflow
 
-Use the Jupyter notebook (`scripts/image_filter.ipynb`) to:
-- Load and resize arbitrary images
-- Export them as raw `uint8` binary files (`.bin`)
-- Transfer to the board via `mwr` command
-- Display and compare SW/HW filtered results
+Use `scripts/image_filter.ipynb` to:
+- Load any image, convert to grayscale or RGB, and resize it
+- Export as a raw `uint8` binary `.bin` file
+- Transfer to the board: `mwr -size b -bin -file image.bin <addr> <size>`
+- After processing, read back: `mrd -size h -bin -file output.bin <addr> <count>`
+- Display and compare SW and HW filtered results side by side
 
 ---
 
-## Output Format
+## Output Image Size
 
-The accelerator output image is smaller than the input by `2×FilterRadius` in each dimension (border pixels with incomplete neighborhoods are not computed):
+Border pixels with incomplete neighborhoods are not computed. The output is smaller than the input by `2×FilterRadius` in each dimension:
 
 ```
 output_width  = input_width  − 2 × FilterRadius
@@ -193,6 +256,7 @@ output_height = input_height − 2 × FilterRadius
 ## Authors
 
 Developed by my friend and I as part of the *Digitalni VLSI Sistemi* course, 2025/26.  
+Faculty of Electrical Engineering, University of Belgrade.
 
 ---
 
