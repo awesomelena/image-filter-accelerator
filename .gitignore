@@ -1,0 +1,45 @@
+# ── Vivado / Xilinx ──────────────────────────────────────
+*.jou
+*.log
+*.str
+*.xpr
+*.bit
+*.ltx
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.gen/
+*.srcs/
+.Xil/
+vivado_pid*.str
+webtalk_*.xml
+
+# ── Vitis / SDK ──────────────────────────────────────────
+*.sdk/
+*.hdf
+*.xsa
+Debug/
+Release/
+RemoteSystemsTempFiles/
+.metadata/
+.launches/
+
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+.env
+.venv/
+
+# ── C ────────────────────────────────────────────────────
+*.o
+*.out
+*.elf
+*.map
+
+# ── OS clutter ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
